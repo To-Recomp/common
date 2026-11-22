@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Tests use small synthetic GameCube images built in memory. No game data is involved.
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -17,6 +18,19 @@
 #include "torecomp/gcm.hpp"
 #include "torecomp/hostpath.hpp"
 #include "torecomp/sha1.hpp"
+
+#ifdef TORECOMP_HAVE_ZLIB
+#include <zlib.h>
+#endif
+#ifdef TORECOMP_HAVE_BZIP2
+#include <bzlib.h>
+#endif
+#ifdef TORECOMP_HAVE_LZMA
+#include <lzma.h>
+#endif
+#ifdef TORECOMP_HAVE_ZSTD
+#include <zstd.h>
+#endif
 
 using namespace torecomp;
 namespace fs = std::filesystem;
@@ -491,6 +505,572 @@ static void test_extract_refuses_overwrite(const Temp& t) {
   CHECK_THROWS(extract(img, out));
 }
 
+// ---- compressed containers --------------------------------------------------------------------
+// The writers below produce CISO, GCZ, WIA and RVZ files from a plain image so the readers can
+// be checked against it. They are written from the format descriptions, independently of the
+// readers (the readers are in src/). Formats and codecs that cannot be built here are skipped.
+
+static void be32w(Bytes& b, std::uint32_t v) {
+  for (int s = 24; s >= 0; s -= 8) b.push_back(static_cast<std::uint8_t>(v >> s));
+}
+static void be64w(Bytes& b, std::uint64_t v) {
+  be32w(b, static_cast<std::uint32_t>(v >> 32));
+  be32w(b, static_cast<std::uint32_t>(v));
+}
+static void le32w(Bytes& b, std::uint32_t v) {
+  for (int s = 0; s < 32; s += 8) b.push_back(static_cast<std::uint8_t>(v >> s));
+}
+static void le64w(Bytes& b, std::uint64_t v) {
+  le32w(b, static_cast<std::uint32_t>(v));
+  le32w(b, static_cast<std::uint32_t>(v >> 32));
+}
+static bool all_zero(const std::uint8_t* p, std::size_t n) {
+  for (std::size_t i = 0; i < n; ++i) if (p[i]) return false;
+  return true;
+}
+static Bytes slice(const Bytes& b, std::size_t off, std::size_t n) {
+  return Bytes(b.begin() + static_cast<std::ptrdiff_t>(off), b.begin() + static_cast<std::ptrdiff_t>(off + n));
+}
+
+static Bytes write_ciso(const Bytes& img, std::uint32_t block) {
+  Bytes out(0x8000, 0);
+  std::memcpy(out.data(), "CISO", 4);
+  out[4] = block;
+  out[5] = block >> 8;
+  out[6] = block >> 16;
+  out[7] = block >> 24;
+  for (std::size_t b = 0; b * block < img.size(); ++b) {
+    const std::size_t n = std::min<std::size_t>(block, img.size() - b * block);
+    if (all_zero(&img[b * block], n)) continue;
+    out[8 + b] = 1;
+    out.insert(out.end(), img.begin() + static_cast<std::ptrdiff_t>(b * block),
+               img.begin() + static_cast<std::ptrdiff_t>(b * block + n));
+  }
+  return out;
+}
+
+static std::uint32_t adler(const Bytes& b) {
+  std::uint32_t a = 1, c = 0;
+  for (std::uint8_t x : b) {
+    a = (a + x) % 65521;
+    c = (c + a) % 65521;
+  }
+  return (c << 16) | a;
+}
+
+#ifdef TORECOMP_HAVE_ZLIB
+static Bytes write_gcz(const Bytes& img, std::uint32_t block) {
+  const std::size_t blocks = (img.size() + block - 1) / block;
+  Bytes data, ptrs, hashes;
+  for (std::size_t b = 0; b < blocks; ++b) {
+    const Bytes plain = slice(img, b * block, std::min<std::size_t>(block, img.size() - b * block));
+    Bytes z(compressBound(static_cast<uLong>(plain.size())));
+    uLongf zn = static_cast<uLongf>(z.size());
+    compress2(z.data(), &zn, plain.data(), static_cast<uLong>(plain.size()), 6);
+    z.resize(zn);
+    const bool stored = z.size() >= plain.size();  // incompressible blocks are stored as is
+    const Bytes& chosen = stored ? plain : z;
+    le64w(ptrs, data.size() | (stored ? (std::uint64_t(1) << 63) : 0));
+    le32w(hashes, adler(chosen));
+    data.insert(data.end(), chosen.begin(), chosen.end());
+  }
+  Bytes out;
+  le32w(out, 0xB10BC001u);
+  le32w(out, 0);
+  le64w(out, data.size());
+  le64w(out, img.size());
+  le32w(out, block);
+  le32w(out, static_cast<std::uint32_t>(blocks));
+  out.insert(out.end(), ptrs.begin(), ptrs.end());
+  out.insert(out.end(), hashes.begin(), hashes.end());
+  out.insert(out.end(), data.begin(), data.end());
+  return out;
+}
+#endif
+
+enum Comp { C_NONE = 0, C_PURGE = 1, C_BZIP2 = 2, C_LZMA = 3, C_LZMA2 = 4, C_ZSTD = 5 };
+
+static bool comp_available(int c) {
+  switch (c) {
+    case C_NONE: case C_PURGE: return true;
+#ifdef TORECOMP_HAVE_BZIP2
+    case C_BZIP2: return true;
+#endif
+#ifdef TORECOMP_HAVE_LZMA
+    case C_LZMA: case C_LZMA2: return true;
+#endif
+#ifdef TORECOMP_HAVE_ZSTD
+    case C_ZSTD: return true;
+#endif
+    default: return false;
+  }
+}
+
+static Bytes sha1_bytes(const Bytes& b) {
+  Sha1 s;
+  s.update(b.data(), b.size());
+  const auto d = s.finish();
+  return Bytes(d.begin(), d.end());
+}
+
+static Bytes purge_encode(const Bytes& in) {
+  Bytes out;
+  std::size_t i = 0;
+  while (i < in.size()) {
+    if (in[i] == 0) { ++i; continue; }
+    std::size_t j = i;
+    // a run ends at 64 consecutive zero bytes
+    std::size_t zeros = 0;
+    while (j < in.size() && zeros < 64) {
+      zeros = in[j] == 0 ? zeros + 1 : 0;
+      ++j;
+    }
+    j -= zeros;
+    be32w(out, static_cast<std::uint32_t>(i));
+    be32w(out, static_cast<std::uint32_t>(j - i));
+    out.insert(out.end(), in.begin() + static_cast<std::ptrdiff_t>(i), in.begin() + static_cast<std::ptrdiff_t>(j));
+    i = j;
+  }
+  const Bytes h = sha1_bytes(out);
+  out.insert(out.end(), h.begin(), h.end());
+  return out;
+}
+
+static Bytes lzma_props(int comp) {
+  if (comp == C_LZMA) return Bytes{(2 * 5 + 0) * 9 + 3, 0, 0, 0x10, 0};  // lc=3 lp=0 pb=2, 1 MiB dictionary
+  return Bytes{18};  // LZMA2 dictionary byte: 2 << (18/2 + 11) = 1 MiB
+}
+
+static Bytes compress_with(int comp, const Bytes& in) {
+  switch (comp) {
+    case C_NONE: return in;
+    case C_PURGE: return purge_encode(in);
+#ifdef TORECOMP_HAVE_BZIP2
+    case C_BZIP2: {
+      Bytes out(in.size() + in.size() / 50 + 1024);
+      unsigned int n = static_cast<unsigned int>(out.size());
+      BZ2_bzBuffToBuffCompress(reinterpret_cast<char*>(out.data()), &n,
+                               const_cast<char*>(reinterpret_cast<const char*>(in.data())),
+                               static_cast<unsigned int>(in.size()), 9, 0, 0);
+      out.resize(n);
+      return out;
+    }
+#endif
+#ifdef TORECOMP_HAVE_LZMA
+    case C_LZMA: case C_LZMA2: {
+      lzma_options_lzma opt;
+      lzma_lzma_preset(&opt, 6);
+      opt.dict_size = 1u << 20;
+      opt.lc = 3;
+      opt.lp = 0;
+      opt.pb = 2;
+      lzma_filter f[2] = {{comp == C_LZMA ? LZMA_FILTER_LZMA1 : LZMA_FILTER_LZMA2, &opt}, {LZMA_VLI_UNKNOWN, nullptr}};
+      lzma_stream s = LZMA_STREAM_INIT;
+      CHECK(lzma_raw_encoder(&s, f) == LZMA_OK);
+      Bytes out(in.size() * 2 + 1024);
+      s.next_in = in.data();
+      s.avail_in = in.size();
+      s.next_out = out.data();
+      s.avail_out = out.size();
+      CHECK(lzma_code(&s, LZMA_FINISH) == LZMA_STREAM_END);
+      out.resize(out.size() - s.avail_out);
+      lzma_end(&s);
+      return out;
+    }
+#endif
+#ifdef TORECOMP_HAVE_ZSTD
+    case C_ZSTD: {
+      Bytes out(ZSTD_compressBound(in.size()));
+      out.resize(ZSTD_compress(out.data(), out.size(), in.data(), in.size(), 3));
+      return out;
+    }
+#endif
+    default: return {};
+  }
+}
+
+// Reference lagged Fibonacci generator for the padding encoding. State is the 521 word array.
+static Bytes lfg_generate(const Bytes& seed, std::uint64_t skip, std::size_t n) {
+  std::vector<std::uint32_t> w(521);
+  for (int i = 0; i < 17; ++i) w[i] = (seed[4 * i] << 24) | (seed[4 * i + 1] << 16) | (seed[4 * i + 2] << 8) | seed[4 * i + 3];
+  for (int i = 17; i < 521; ++i) w[i] = (w[i - 17] << 23) ^ (w[i - 16] >> 9) ^ w[i - 1];
+  auto advance = [&] {
+    for (int i = 0; i < 32; ++i) w[i] ^= w[i + 489];
+    for (int i = 32; i < 521; ++i) w[i] ^= w[i - 32];
+  };
+  for (int i = 0; i < 4; ++i) advance();
+  Bytes stream;
+  const std::size_t words = (skip + n + 3) / 4;
+  while (stream.size() / 4 < words) {
+    for (int i = 0; i < 521; ++i) {
+      stream.push_back(w[i] >> 24);
+      stream.push_back(w[i] >> 18);
+      stream.push_back(w[i] >> 8);
+      stream.push_back(w[i]);
+    }
+    advance();
+  }
+  return Bytes(stream.begin() + static_cast<std::ptrdiff_t>(skip), stream.begin() + static_cast<std::ptrdiff_t>(skip + n));
+}
+
+struct JunkRun {
+  std::uint64_t disc_offset;  // must lie inside one group
+  std::size_t length;
+  Bytes seed;  // 68 bytes
+};
+
+struct WiaOpts {
+  bool rvz = false;
+  int comp = C_NONE;
+  std::uint32_t chunk = 0x200000;
+  std::vector<JunkRun> junk;  // RVZ packing
+  std::uint32_t disc_type = 1;
+  std::uint32_t split = 0;  // second raw-data entry starts here (0: single entry)
+};
+
+static Bytes write_wia(const Bytes& img, const WiaOpts& o) {
+  struct E { std::uint64_t off, size; };
+  std::vector<E> entries;
+  if (o.split) {
+    entries.push_back({0x80, o.split - 0x80});
+    entries.push_back({o.split, img.size() - o.split});
+  } else {
+    entries.push_back({0x80, img.size() - 0x80});
+  }
+  Bytes body;  // everything after the headers; file offsets are 0x124 + position
+  const std::size_t base = 0x48 + 0xDC;
+  auto place = [&](const Bytes& b) {
+    while ((base + body.size()) % 4) body.push_back(0);
+    const std::size_t at = base + body.size();
+    body.insert(body.end(), b.begin(), b.end());
+    return at;
+  };
+  Bytes rawtab, grptab;
+  std::uint32_t group_count = 0;
+  for (const E& e : entries) {
+    const std::uint64_t start = e.off & ~std::uint64_t(0x7FFF), size = e.size + (e.off - start);
+    const std::uint32_t n = static_cast<std::uint32_t>((size + o.chunk - 1) / o.chunk);
+    be64w(rawtab, e.off);
+    be64w(rawtab, e.size);
+    be32w(rawtab, group_count);
+    be32w(rawtab, n);
+    for (std::uint32_t g = 0; g < n; ++g) {
+      const std::uint64_t gs = start + std::uint64_t(g) * o.chunk;
+      const std::size_t len = static_cast<std::size_t>(std::min<std::uint64_t>(o.chunk, start + size - gs));
+      Bytes data = slice(img, static_cast<std::size_t>(gs), len);
+      std::uint32_t packed_size = 0;
+      Bytes payload;
+      bool msb = false;
+      if (all_zero(data.data(), data.size())) {
+        be32w(grptab, 0);
+        be32w(grptab, 0);
+        if (o.rvz) be32w(grptab, 0);
+        ++group_count;
+        continue;
+      }
+      if (o.rvz) {
+        // pack: literal bytes, with the junk runs of this group replaced by seeds
+        Bytes packed;
+        std::size_t pos = 0;
+        for (const JunkRun& j : o.junk) {
+          if (j.disc_offset < gs || j.disc_offset >= gs + len) continue;
+          const std::size_t at = static_cast<std::size_t>(j.disc_offset - gs);
+          if (at > pos) {
+            be32w(packed, static_cast<std::uint32_t>(at - pos));
+            packed.insert(packed.end(), data.begin() + static_cast<std::ptrdiff_t>(pos), data.begin() + static_cast<std::ptrdiff_t>(at));
+          }
+          be32w(packed, static_cast<std::uint32_t>(j.length) | 0x80000000u);
+          packed.insert(packed.end(), j.seed.begin(), j.seed.end());
+          pos = at + j.length;
+        }
+        if (!o.junk.empty() && packed.size()) {
+          if (pos < len) {
+            be32w(packed, static_cast<std::uint32_t>(len - pos));
+            packed.insert(packed.end(), data.begin() + static_cast<std::ptrdiff_t>(pos), data.end());
+          }
+          data = packed;
+          packed_size = static_cast<std::uint32_t>(packed.size());
+        }
+        Bytes z = compress_with(o.comp, data);
+        if (o.comp != C_NONE && z.size() < data.size()) {
+          payload = z;
+          msb = true;
+        } else {
+          payload = data;  // stored with compression method NONE
+        }
+      } else {
+        payload = compress_with(o.comp, data);
+      }
+      const std::size_t at = place(payload);
+      be32w(grptab, static_cast<std::uint32_t>(at / 4));
+      be32w(grptab, static_cast<std::uint32_t>(payload.size()) | (msb ? 0x80000000u : 0));
+      if (o.rvz) be32w(grptab, packed_size);
+      ++group_count;
+    }
+  }
+  const Bytes rawz = compress_with(o.comp, rawtab), grpz = compress_with(o.comp, grptab);
+  const std::size_t raw_off = place(rawz), grp_off = place(grpz);
+
+  Bytes d2;
+  be32w(d2, o.disc_type);
+  be32w(d2, o.comp);
+  be32w(d2, 3);
+  be32w(d2, o.chunk);
+  d2.insert(d2.end(), img.begin(), img.begin() + 0x80);
+  be32w(d2, 0);  // partitions
+  be32w(d2, 0x30);
+  be64w(d2, 0);
+  d2.insert(d2.end(), 20, 0);
+  be32w(d2, static_cast<std::uint32_t>(entries.size()));
+  be64w(d2, raw_off);
+  be32w(d2, static_cast<std::uint32_t>(rawz.size()));
+  be32w(d2, group_count);
+  be64w(d2, grp_off);
+  be32w(d2, static_cast<std::uint32_t>(grpz.size()));
+  Bytes props = o.comp == C_LZMA || o.comp == C_LZMA2 ? lzma_props(o.comp) : Bytes{};
+  d2.push_back(static_cast<std::uint8_t>(props.size()));
+  props.resize(7, 0);
+  d2.insert(d2.end(), props.begin(), props.end());
+
+  Bytes out;
+  for (char c : std::string(o.rvz ? "RVZ" : "WIA")) out.push_back(static_cast<std::uint8_t>(c));
+  out.push_back(1);
+  be32w(out, 0x01000000);
+  be32w(out, o.rvz ? 0x00030000 : 0x00090000);
+  be32w(out, static_cast<std::uint32_t>(d2.size()));
+  const Bytes h2 = sha1_bytes(d2);
+  out.insert(out.end(), h2.begin(), h2.end());
+  be64w(out, img.size());
+  be64w(out, base + body.size());
+  const Bytes h1 = sha1_bytes(out);
+  out.insert(out.end(), h1.begin(), h1.end());
+  out.insert(out.end(), d2.begin(), d2.end());
+  out.insert(out.end(), body.begin(), body.end());
+  return out;
+}
+
+static Bytes read_all(const fs::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  return Bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// Every observable property of the reader must match the plain image.
+static void check_same_as_plain(const fs::path& plain, const fs::path& other, const char* format, bool same_size) {
+  gcm::Image a(plain), b(other);
+  CHECK(std::string(b.format()) == format);
+  CHECK(a.game_id() == b.game_id());
+  CHECK(a.title() == b.title());
+  CHECK(a.disc_number() == b.disc_number());
+  CHECK(a.files().size() == b.files().size());
+  if (same_size) {
+    CHECK(a.size() == b.size());
+    CHECK(hash_whole_image(a) == hash_whole_image(b));
+    // random access, including reads that straddle chunk and block boundaries
+    for (std::uint64_t off : {0ull, 1ull, 0x7Full, 0x80ull, 0x7FFFull, 0x8000ull, 0x3800ull, 0x4000ull}) {
+      Bytes x(0x9000), y(0x9000);
+      if (off + x.size() > a.size()) continue;
+      a.read(off, x.data(), x.size());
+      b.read(off, y.data(), y.size());
+      CHECK(x == y);
+    }
+  }
+  CHECK(build_manifest(a).content_sha1 == build_manifest(b).content_sha1);
+}
+
+static std::string describe(const char* what, int comp, std::uint32_t chunk) {
+  return std::string(what) + " comp=" + std::to_string(comp) + " chunk=" + std::to_string(chunk);
+}
+
+static void test_compressed_images(const Temp& t) {
+  const Node tree = sample_tree();
+  // 0xAA padding: every block has data. A second image with zero padding gives sparse files.
+  Bytes dense = build_image(tree, 0xAA);
+  Bytes sparse = build_image(tree, 0);
+  // Padding written with the lagged Fibonacci generator, as on real discs (only inside the
+  // gap between main.dol and the FST, which is not part of any file).
+  JunkRun junk{0x3800, 0x400, Bytes(68)};
+  for (std::size_t i = 0; i < 68; ++i) junk.seed[i] = static_cast<std::uint8_t>(i * 37 + 11);
+  const Bytes stream = lfg_generate(junk.seed, 0x3800 % 0x8000, junk.length);
+  std::copy(stream.begin(), stream.end(), dense.begin() + 0x3800);
+  CHECK(!all_zero(stream.data(), stream.size()));
+
+  const fs::path plain_dense = t.write("dense.iso", dense);
+  const fs::path plain_sparse = t.write("sparse.iso", sparse);
+
+  // CISO
+  for (std::uint32_t block : {0x8000u, 0x10000u, 0x200000u}) {
+    const fs::path p = t.write("d.ciso", write_ciso(dense, block));
+    check_same_as_plain(plain_dense, p, "CISO", true);
+    const fs::path q = t.write("s.ciso", write_ciso(sparse, block));
+    check_same_as_plain(plain_sparse, q, "CISO", false);  // trailing zero blocks are not stored
+  }
+  {
+    Bytes bad = write_ciso(dense, 0x8000);
+    bad[4] = 3;  // block size 3
+    CHECK_THROWS(gcm::Image(t.write("bad.ciso", bad)));
+    Bytes cut = write_ciso(dense, 0x8000);
+    cut.resize(cut.size() - 0x9000);
+    CHECK_THROWS(gcm::Image(t.write("cut.ciso", cut)));
+  }
+
+#ifdef TORECOMP_HAVE_ZLIB
+  for (std::uint32_t block : {0x8000u, 0x4000u}) {
+    const fs::path p = t.write("d.gcz", write_gcz(dense, block));
+    check_same_as_plain(plain_dense, p, "GCZ", true);
+    const fs::path q = t.write("s.gcz", write_gcz(sparse, block));
+    check_same_as_plain(plain_sparse, q, "GCZ", true);
+  }
+  {
+    Bytes g = write_gcz(dense, 0x8000);
+    g[g.size() - 100] ^= 0x55;  // corrupt block data: the Adler-32 check must catch it
+    gcm::Image* img = nullptr;
+    bool threw = false;
+    try {
+      img = new gcm::Image(t.write("bad.gcz", g));
+      hash_whole_image(*img);
+    } catch (const Error&) { threw = true; }
+    delete img;
+    CHECK(threw);
+    Bytes cut = write_gcz(dense, 0x8000);
+    cut.resize(cut.size() / 2);
+    CHECK_THROWS(gcm::Image(t.write("cut.gcz", cut)));
+  }
+#else
+  std::puts("note: GCZ not tested (no zlib)");
+#endif
+
+  // WIA and RVZ
+  for (bool rvz : {false, true}) {
+    for (int comp = C_NONE; comp <= C_ZSTD; ++comp) {
+      if (rvz && comp == C_PURGE) continue;
+      if (!rvz && comp == C_ZSTD) continue;
+      if (!comp_available(comp)) {
+        std::printf("note: %s compression %d not tested (library missing)\n", rvz ? "RVZ" : "WIA", comp);
+        continue;
+      }
+      for (std::uint32_t chunk : rvz ? std::vector<std::uint32_t>{0x8000, 0x10000, 0x200000}
+                                     : std::vector<std::uint32_t>{0x200000, 0x400000}) {
+        for (std::uint32_t split : {0u, 0x10000u}) {
+          WiaOpts o;
+          o.rvz = rvz;
+          o.comp = comp;
+          o.chunk = chunk;
+          o.split = split;
+          if (rvz) o.junk.push_back(junk);
+          const std::string label = describe(rvz ? "RVZ" : "WIA", comp, chunk);
+          const fs::path p = t.write("d.wia", write_wia(dense, o));
+          try {
+            check_same_as_plain(plain_dense, p, rvz ? "RVZ" : "WIA", true);
+            o.junk.clear();  // the sparse image has no generated padding
+            const fs::path q = t.write("s.wia", write_wia(sparse, o));
+            check_same_as_plain(plain_sparse, q, rvz ? "RVZ" : "WIA", true);
+          } catch (const Error& e) {
+            std::fprintf(stderr, "%s: unexpected error: %s\n", label.c_str(), e.what());
+            ++g_failures;
+          }
+        }
+      }
+    }
+  }
+
+  // Malformed WIA/RVZ files must be rejected with torecomp::Error, never crash.
+  {
+    WiaOpts o;
+    o.comp = C_PURGE;
+    const Bytes good = write_wia(dense, o);
+    Bytes b = good;
+    b.resize(b.size() - 1);
+    CHECK_THROWS(gcm::Image(t.write("cut.wia", b)));
+    b = good;
+    b[0x20] ^= 1;  // header checksum
+    CHECK_THROWS(gcm::Image(t.write("hdr.wia", b)));
+    b = good;
+    b[0x124 + 3] ^= 0xFF;  // group data: PURGE checksum (hit when the group is read)
+    {
+      bool threw = false;
+      try {
+        gcm::Image img(t.write("grp.wia", b));
+        hash_whole_image(img);
+      } catch (const Error&) { threw = true; }
+      CHECK(threw);
+    }
+    WiaOpts w;
+    w.disc_type = 2;
+    CHECK_THROWS(gcm::Image(t.write("wii.wia", write_wia(dense, w))));
+    WiaOpts c;
+    c.chunk = 0x1234;
+    CHECK_THROWS(gcm::Image(t.write("chunk.wia", write_wia(dense, c))));
+    WiaOpts z;
+    z.rvz = true;
+    z.comp = C_PURGE;
+    CHECK_THROWS(gcm::Image(t.write("purge.rvz", write_wia(dense, z))));
+  }
+
+  // Bit flips anywhere in a container: either still readable or torecomp::Error.
+  {
+    std::vector<Bytes> files;
+    files.push_back(write_ciso(dense, 0x8000));
+    WiaOpts a;
+    a.comp = C_PURGE;
+    files.push_back(write_wia(dense, a));
+    WiaOpts r;
+    r.rvz = true;
+    r.chunk = 0x8000;
+    r.junk.push_back(junk);
+    files.push_back(write_wia(dense, r));
+#ifdef TORECOMP_HAVE_ZLIB
+    files.push_back(write_gcz(dense, 0x8000));
+#endif
+    std::uint32_t seed = 12345;
+    for (const Bytes& f : files) {
+      const std::size_t limit = std::min<std::size_t>(f.size(), 0x400);  // headers and tables
+      for (int i = 0; i < 300; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        Bytes b = f;
+        const std::size_t at = (i < 150 ? seed % limit : seed % f.size());
+        b[at] ^= static_cast<std::uint8_t>(1u << (seed >> 29));
+        try {
+          gcm::Image img(t.write("fuzz.bin", b));
+          hash_whole_image(img);
+        } catch (const Error&) {
+        }
+      }
+    }
+  }
+
+  // Optional manual check against a real disc: TOREC_TEST_ISO=/path/game.iso converts it with the
+  // writers above and compares content hashes and whole-image hashes (needs ~3x its size in RAM).
+  if (const char* iso = std::getenv("TOREC_TEST_ISO")) {
+    const Bytes big = read_all(iso);
+    const fs::path ref = iso;
+    gcm::Image a(ref);
+    const std::string content = build_manifest(a).content_sha1;
+    const std::string whole = hash_whole_image(a);
+    auto compare = [&](const char* name, const Bytes& data, const char* format) {
+      const fs::path p = t.write(std::string("real.") + name, data);
+      gcm::Image b(p);
+      const bool ok = std::string(b.format()) == format && build_manifest(b).content_sha1 == content &&
+                      hash_whole_image(b) == whole;
+      std::printf("real disc as %s: %s\n", name, ok ? "identical" : "DIFFERENT");
+      CHECK(ok);
+      fs::remove(p);
+    };
+    compare("ciso", write_ciso(big, 0x200000), "CISO");
+#ifdef TORECOMP_HAVE_ZLIB
+    compare("gcz", write_gcz(big, 0x8000), "GCZ");
+#endif
+    WiaOpts w;
+    w.comp = C_PURGE;
+    compare("wia-purge", write_wia(big, w), "WIA");
+#ifdef TORECOMP_HAVE_ZSTD
+    WiaOpts r;
+    r.rvz = true;
+    r.comp = C_ZSTD;
+    compare("rvz-zstd", write_wia(big, r), "RVZ");
+#endif
+  }
+}
+
 int main() {
   Temp t;
   test_sha1();
@@ -506,6 +1086,7 @@ int main() {
   test_extract_never_escapes(t);
   test_extract_long_path(t);
   test_extract_refuses_overwrite(t);
+  test_compressed_images(t);
   if (g_failures) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);
     return 1;

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "torecomp/gcm.hpp"
 
+#include "disc_source.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -34,19 +36,15 @@ bool valid_component(const std::string& name) {
 
 }  // namespace
 
-Image::Image(const std::filesystem::path& path) : path_(path), in_(path, std::ios::binary) {
-  if (!in_) throw Error("cannot open " + path.string());
-  in_.seekg(0, std::ios::end);
-  const std::streamoff end = in_.tellg();
-  if (end < 0) throw Error("cannot determine the size of " + path.string());
-  size_ = static_cast<std::uint64_t>(end);
+Image::Image(const std::filesystem::path& path) : path_(path), source_(open_source(path)) {
+  size_ = source_->size();
   if (size_ < kMinImageSize) throw Error(path.string() + ": too small to be a GameCube disc");
 
   std::array<std::uint8_t, 0x440> h;
   read(0, h.data(), h.size());
   if (be32(&h[0x1C]) != kGcMagic) {
-    throw Error(path.string() + ": not a plain GameCube disc image (magic number missing). "
-                "Compressed formats (RVZ, CISO, NKit) are not supported yet.");
+    throw Error(path.string() + ": not a GameCube disc image (magic number missing). "
+                "Supported: ISO, CISO, GCZ, WIA and RVZ. Wii discs and NKit images are not supported.");
   }
   for (int i = 0; i < 6; ++i) {
     if (h[i] < 0x20 || h[i] > 0x7E) throw Error(path.string() + ": invalid game ID");
@@ -85,12 +83,15 @@ Image::Image(const std::filesystem::path& path) : path_(path), in_(path, std::io
   parse_fst();
 }
 
+Image::~Image() = default;
+Image::Image(Image&&) noexcept = default;
+Image& Image::operator=(Image&&) noexcept = default;
+
+const char* Image::format() const { return source_->format(); }
+
 void Image::read(std::uint64_t offset, void* dst, std::size_t length) {
   if (offset > size_ || length > size_ - offset) throw Error(path_.string() + ": read past end of image");
-  in_.clear();
-  in_.seekg(static_cast<std::streamoff>(offset));
-  in_.read(static_cast<char*>(dst), static_cast<std::streamsize>(length));
-  if (!in_) throw Error(path_.string() + ": read error");
+  source_->read(offset, dst, length);
 }
 
 void Image::read_chunks(std::uint64_t offset, std::uint64_t length,
