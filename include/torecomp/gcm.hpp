@@ -3,8 +3,8 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,11 +32,21 @@ struct Region {
   std::uint64_t size = 0;
 };
 
-// A plain (uncompressed) GameCube disc image. Everything read from the file is bounds-checked;
-// a malformed image throws torecomp::Error from the constructor.
+class DiscSource;
+
+// A GameCube disc image: plain ISO, or CISO, GCZ, WIA or RVZ (recognised by their magic number and
+// read transparently; the disc content, `size()` and `read()` are the same for all of them).
+// Everything read from the file is bounds-checked; a malformed image throws torecomp::Error from
+// the constructor. Wii discs are not supported.
 class Image {
 public:
   explicit Image(const std::filesystem::path& path);
+  ~Image();
+  Image(Image&&) noexcept;
+  Image& operator=(Image&&) noexcept;
+
+  // Container format: "ISO", "CISO", "GCZ", "WIA" or "RVZ".
+  const char* format() const;
 
   const std::filesystem::path& path() const { return path_; }
   std::uint64_t size() const { return size_; }
@@ -66,7 +76,7 @@ private:
   void parse_fst();
 
   std::filesystem::path path_;
-  std::ifstream in_;
+  std::unique_ptr<DiscSource> source_;
   std::uint64_t size_ = 0;
   std::string game_id_, maker_, title_;
   std::uint8_t disc_number_ = 0, version_ = 0;

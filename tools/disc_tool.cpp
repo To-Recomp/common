@@ -17,12 +17,12 @@ namespace {
 void usage() {
   std::fputs(
       "usage: torecomp-disc <command> ...\n"
-      "  info <disc.iso>                       header, apploader, main.dol and file count\n"
-      "  hash <disc.iso>                       whole-image SHA-1 (what Redump lists)\n"
-      "  manifest <disc.iso>                   content manifest and content_sha1 for dumps.toml\n"
-      "  identify <dumps.toml> <disc.iso>...   match discs against the database, report missing discs\n"
-      "  extract <dumps.toml> <disc.iso> <out> extract a disc that the database recognises\n"
-      "  extract --unverified <disc.iso> <out> extract without a database (no hash check)\n",
+      "  info <disc>                       header, apploader, main.dol and file count\n"
+      "  hash <disc>                       whole-image SHA-1 (what Redump lists)\n"
+      "  manifest <disc>                   content manifest and content_sha1 for dumps.toml\n"
+      "  identify <dumps.toml> <disc>...   match discs against the database, report missing discs\n"
+      "  extract <dumps.toml> <disc> <out> extract a disc that the database recognises\n"
+      "  extract --unverified <disc> <out> extract without a database (no hash check)\n",
       stderr);
 }
 
@@ -40,6 +40,7 @@ Progress make_progress(const char* label) {
 int cmd_info(const char* path) {
   gcm::Image img(path);
   std::printf("file:       %s\n", path);
+  std::printf("format:     %s\n", img.format());
   std::printf("size:       %llu\n", static_cast<unsigned long long>(img.size()));
   std::printf("game id:    %s (maker %s)\n", img.game_id().c_str(), img.maker().c_str());
   std::printf("disc:       %u (0-based), version %u\n", img.disc_number(), img.version());

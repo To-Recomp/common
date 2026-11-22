@@ -6,7 +6,16 @@ Not affiliated with or endorsed by Bandai Namco Entertainment, Sony Interactive 
 
 ## Status (M1)
 
-GameCube only, plain `.iso` images only (RVZ, CISO and NKit are not supported yet).
+GameCube only. Disc images can be plain `.iso`, **CISO**, **GCZ**, **WIA** or **RVZ**; the format is detected from the file's magic number and every command works the same on all of them (same content hash, same `identify` result). Wii discs and NKit images are not supported.
+
+| Format | Needs | Notes |
+| --- | --- | --- |
+| CISO | nothing | The format does not store the disc size: it ends at the last stored block, so a CISO whose last blocks are all zero is reported shorter than the ISO (the content hash is unaffected, the whole-image SHA-1 may differ). |
+| GCZ | zlib | Every block's Adler-32 is verified. |
+| WIA | bzip2, liblzma (PURGE and uncompressed need nothing) | Header and PURGE checksums are verified. |
+| RVZ | zstd, bzip2, liblzma | Including RVZ-packed padding (lagged Fibonacci seeds). |
+
+The decompression libraries are found by CMake (`ZLIB`, `BZip2`, `LibLZMA`, and zstd via `find_path`/`find_library`; install e.g. `zlib1g-dev libbz2-dev liblzma-dev libzstd-dev`). A missing one only disables the formats that need it: opening such an image fails with an error that names the library. Configure with `-DTORECOMP_REQUIRE_CODECS=ON` to make a missing library a configuration error instead.
 
 | Piece | Header | What it does |
 | --- | --- | --- |
@@ -30,17 +39,21 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Tests use small synthetic discs built in memory; no game data is needed. Built and tested on Linux with GCC only.
+Tests use small synthetic discs built in memory; no game data is needed. The tests contain their own minimal CISO, GCZ, WIA and RVZ writers (none, PURGE, bzip2, LZMA, LZMA2 and Zstandard, with RVZ padding packing) and check every reader against the plain image; codecs that are not installed are skipped with a note.
+
+Manual check with a real disc: `TOREC_TEST_ISO=/path/to/game.iso ./build/torecomp_tests` converts that disc with the test writers (CISO, GCZ, WIA-PURGE, RVZ-Zstd; needs about three times the disc size in RAM) and verifies that the content hash and the whole-image SHA-1 are identical to the ISO's. A second manual check is to convert the disc to RVZ/WIA/GCZ/CISO with Dolphin (`dolphin-tool convert`) and compare `torecomp-disc hash` and `manifest` of both files. That is the only way to test images written by real encoders (the test writers are ours); it has not been done in CI.
+
+Built and tested on Linux with GCC only.
 
 ## `torecomp-disc`
 
 ```
-torecomp-disc info <disc.iso>
-torecomp-disc hash <disc.iso>
-torecomp-disc manifest <disc.iso>
-torecomp-disc identify <dumps.toml> <disc.iso>...
-torecomp-disc extract <dumps.toml> <disc.iso> <out>
-torecomp-disc extract --unverified <disc.iso> <out>
+torecomp-disc info <disc>
+torecomp-disc hash <disc>
+torecomp-disc manifest <disc>
+torecomp-disc identify <dumps.toml> <disc>...
+torecomp-disc extract <dumps.toml> <disc> <out>
+torecomp-disc extract --unverified <disc> <out>
 ```
 
 `extract` writes `sys/` (boot.bin, bi2.bin, apploader.img, fst.bin, main.dol), `files/` and `paths.tsv`. Names that are unusable on Windows or macOS (`CON`, `a:b`, trailing dots, names differing only by case) are mapped the same way on every OS and never leave the output folder; `paths.tsv` maps each disc path to its host path (`torecomp/hostpath.hpp`, `PathMap`). It refuses discs the database does not recognise.
