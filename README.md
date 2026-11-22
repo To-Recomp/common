@@ -43,7 +43,7 @@ torecomp-disc extract <dumps.toml> <disc.iso> <out>
 torecomp-disc extract --unverified <disc.iso> <out>
 ```
 
-`extract` writes `sys/` (boot.bin, bi2.bin, apploader.img, fst.bin, main.dol) and `files/`. It refuses discs the database does not recognise.
+`extract` writes `sys/` (boot.bin, bi2.bin, apploader.img, fst.bin, main.dol), `files/` and `paths.tsv`. Names that are unusable on Windows or macOS (`CON`, `a:b`, trailing dots, names differing only by case) are mapped the same way on every OS and never leave the output folder; `paths.tsv` maps each disc path to its host path (`torecomp/hostpath.hpp`, `PathMap`). It refuses discs the database does not recognise.
 
 ## `dumps.toml`
 

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@
 #include "torecomp/content.hpp"
 #include "torecomp/dumps.hpp"
 #include "torecomp/gcm.hpp"
+#include "torecomp/hostpath.hpp"
 #include "torecomp/sha1.hpp"
 
 using namespace torecomp;
@@ -330,6 +332,165 @@ static void test_extract(const Temp& t) {
   CHECK(!fs::exists(out2));
 }
 
+static std::string slurp(const fs::path& p) {
+  std::ifstream f(hostpath::long_path(p), std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static void test_sanitize() {
+  using hostpath::sanitize_component;
+  CHECK(sanitize_component("plain.bin") == "plain.bin");
+  CHECK(sanitize_component("a<b>c:d\"e|f?g*h") == "a%3Cb%3Ec%3Ad%22e%7Cf%3Fg%2Ah");
+  CHECK(sanitize_component("CON") == "%43ON");
+  CHECK(sanitize_component("nul.txt") == "%6Eul.txt");
+  CHECK(sanitize_component("Com1") == "%43om1");
+  CHECK(sanitize_component("LPT9.dat") == "%4CPT9.dat");
+  CHECK(sanitize_component("COM0") == "COM0");
+  CHECK(sanitize_component("CONSOLE") == "CONSOLE");
+  CHECK(sanitize_component("name.") == "name%2E");
+  CHECK(sanitize_component("name ") == "name%20");
+  CHECK(sanitize_component("100%25") == "100%2525");  // a literal escape-looking sequence stays distinct
+  CHECK(sanitize_component("100%") == "100%");
+  CHECK(sanitize_component("caf\xC3\xA9.txt") == "caf\xC3\xA9.txt");
+  CHECK_THROWS(sanitize_component(""));
+  CHECK_THROWS(sanitize_component("."));
+  CHECK_THROWS(sanitize_component(".."));
+  CHECK_THROWS(sanitize_component(std::string(256, 'a')));
+  CHECK(sanitize_component(std::string(255, 'a')).size() == 255);
+}
+
+static void test_plan_collisions() {
+  using hostpath::plan;
+  // Case-insensitive collisions: the later path (in sorted order) is renamed, reproducibly.
+  const std::vector<std::string> paths = {"Data/A.bin", "Data/a.bin", "Data/a.BIN", "data/b.bin", "x", "x/y"};
+  const auto host = plan(paths);
+  CHECK(host.size() == paths.size());
+  CHECK(host[0] == "Data/A.bin");
+  CHECK(host[1] == "Data/a~1.bin");
+  CHECK(host[2] == "Data/a~2.BIN");
+  CHECK(host[3] == "data~1/b.bin");  // folder that differs only by case
+  CHECK(host[4] == "x");
+  CHECK(host[5] == "x~1/y");  // file and folder with one name
+  CHECK(plan(paths) == host);
+  std::set<std::string> seen;
+  for (const auto& h : host) CHECK(seen.insert(hostpath::fold(h)).second);
+}
+
+static void test_extract_windows_unsafe_names(const Temp& t) {
+  Node root;
+  root.kids["CON"].dir = false;
+  root.kids["CON"].data = "device";
+  add_file(root, "dir./trail.", "trailing dot");
+  add_file(root, "q?.bin", "question");
+  root.kids["colon:name"].dir = false;
+  root.kids["colon:name"].data = "colon";
+  add_file(root, "Case.bin", "upper");
+  add_file(root, "case.bin", "lower");
+  add_file(root, "aux/nul.txt", "nested device");
+  const fs::path iso = t.write("unsafe.iso", build_image(root, 0));
+  gcm::Image img(iso);
+  const std::string expected = build_manifest(img).content_sha1;
+
+  const fs::path out = t.dir / "unsafe-out";
+  const Manifest m = extract(img, out, expected);
+  CHECK(m.content_sha1 == expected);  // mapping does not change the content hash
+
+  std::map<std::string, std::string> host;
+  for (const auto& l : m.lines) {
+    if (l.kind == "file") host[l.path] = l.host_path;
+  }
+  CHECK(host["CON"] == "%43ON");
+  CHECK(host["dir./trail."] == "dir%2E/trail%2E");
+  CHECK(host["q?.bin"] == "q%3F.bin");
+  CHECK(host["colon:name"] == "colon%3Aname");
+  CHECK(host["Case.bin"] == "Case.bin");
+  CHECK(host["case.bin"] == "case~1.bin");
+  CHECK(host["aux/nul.txt"] == "%61ux/%6Eul.txt");
+  CHECK(slurp(out / "files" / "%43ON") == "device");
+  CHECK(slurp(out / "files" / "Case.bin") == "upper");
+  CHECK(slurp(out / "files" / "case~1.bin") == "lower");
+  CHECK(slurp(out / "files" / "%61ux" / "%6Eul.txt") == "nested device");
+
+  // The disc path still finds the file, including with different case.
+  const hostpath::PathMap map = hostpath::PathMap::load(out);
+  CHECK(map.find("CON") == "%43ON");
+  CHECK(map.find("con") == "%43ON");
+  CHECK(map.find("DIR./TRAIL.") == "dir%2E/trail%2E");
+  CHECK(map.find("case.bin") == "case~1.bin");  // exact match beats case folding
+  CHECK(map.find("CASE.BIN") == "Case.bin");
+  CHECK(map.find("missing.bin").empty());
+  CHECK(slurp(map.find_path("Colon:Name")) == "colon");
+  CHECK(map.find_path("missing.bin").empty());
+
+  // Same disc, same mapping.
+  gcm::Image again(iso);
+  const fs::path out2 = t.dir / "unsafe-out2";
+  const Manifest m2 = extract(again, out2);
+  for (std::size_t i = 0; i < m.lines.size(); ++i) CHECK(m.lines[i].host_path == m2.lines[i].host_path);
+}
+
+static void test_extract_never_escapes(const Temp& t) {
+  // Names that the image parser accepts must stay inside the output folder after mapping; names that
+  // could escape it are rejected before anything is written.
+  const char* bad[] = {"..", ".", "", "a/b", "a\\b", "/abs", "C:\\evil"};
+  int n = 0;
+  for (const char* name : bad) {
+    Node root;
+    root.kids[name].dir = false;
+    root.kids[name].data = "x";
+    const fs::path iso = t.write("evil" + std::to_string(n++) + ".iso", build_image(root, 0));
+    // "a/b" and "/abs" become nested/absolute paths in the helper's tree only when split; here the
+    // slash is inside one FST name, which the parser must refuse.
+    bool contained = true;
+    try {
+      gcm::Image img(iso);
+      const fs::path out = t.dir / ("evil-out" + std::to_string(n));
+      extract(img, out);
+      for (const auto& e : fs::recursive_directory_iterator(out)) {
+        const fs::path rel = fs::relative(e.path(), out);
+        for (const auto& part : rel) {
+          if (part == "..") contained = false;
+        }
+      }
+    } catch (const torecomp::Error&) {
+    }
+    CHECK(contained);
+  }
+  CHECK(!fs::exists(t.dir.parent_path() / "evil"));
+  CHECK(!fs::exists(t.dir / "abs"));
+
+  // A name of 'only' escapes, absolute, drive letters: refused by the parser.
+  Node abs;
+  abs.kids["/etc"].dir = false;
+  CHECK_THROWS(gcm::Image(t.write("abs.iso", build_image(abs, 0))));
+  Node drive;
+  drive.kids["C:\\x"].dir = false;
+  CHECK_THROWS(gcm::Image(t.write("drive.iso", build_image(drive, 0))));
+}
+
+static void test_extract_long_path(const Temp& t) {
+  // 3 x 100 + file name: over Windows' MAX_PATH once combined with the temp folder.
+  const std::string d(100, 'd');
+  Node root;
+  add_file(root, d + "/" + d + "/" + d + "/" + std::string(60, 'f') + ".bin", "deep");
+  gcm::Image img(t.write("long.iso", build_image(root, 0)));
+  const fs::path out = t.dir / "long-out";
+  extract(img, out);
+  const fs::path file = out / "files" / d / d / d / (std::string(60, 'f') + ".bin");
+  CHECK(slurp(file) == "deep");
+}
+
+static void test_extract_refuses_overwrite(const Temp& t) {
+  // The write-time guard that backs the collision handling on file systems that fold more than ASCII.
+  Node root;
+  add_file(root, "a.bin", "one");
+  gcm::Image img(t.write("ow.iso", build_image(root, 0)));
+  const fs::path out = t.dir / "ow-out";
+  fs::create_directories(out);
+  extract(img, out);  // empty folder is accepted
+  CHECK_THROWS(extract(img, out));
+}
+
 int main() {
   Temp t;
   test_sha1();
@@ -339,6 +500,12 @@ int main() {
   test_identify(t);
   test_database_rejects_bad_input();
   test_extract(t);
+  test_sanitize();
+  test_plan_collisions();
+  test_extract_windows_unsafe_names(t);
+  test_extract_never_escapes(t);
+  test_extract_long_path(t);
+  test_extract_refuses_overwrite(t);
   if (g_failures) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);
     return 1;

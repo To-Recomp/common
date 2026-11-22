@@ -15,6 +15,10 @@ struct ManifestLine {
   std::uint64_t size = 0;
   std::string sha1;
   std::string path;  // empty except for "file"
+  // Where extract() wrote a "file" entry, relative to `files/` in the output folder ('/'-separated).
+  // Differs from `path` when the disc name is unusable on some host (see hostpath.hpp). Not part of
+  // text() and so not of the content hash; empty for build_manifest().
+  std::string host_path;
 };
 
 // Hashes of what a disc contains, independent of where it is laid out and of what fills the unused
@@ -37,7 +41,10 @@ struct Manifest {
 Manifest build_manifest(gcm::Image& image, const Progress& progress = {});
 
 // Extracts the disc into `out_dir` (must not exist or be empty):
-//   sys/boot.bin, sys/bi2.bin, sys/apploader.img, sys/fst.bin, sys/main.dol and files/<path>.
+//   sys/boot.bin, sys/bi2.bin, sys/apploader.img, sys/fst.bin, sys/main.dol, files/<host path> and
+//   paths.tsv (disc path -> host path, read back with hostpath::PathMap).
+// Disc names that are unsafe or unwritable on Windows/macOS are mapped (hostpath.hpp), the same way
+// on every OS; nothing is ever written outside `out_dir`.
 // Hashes everything while copying. If `expected_content_sha1` is non-empty and the hash of what was
 // read differs, everything written is removed and Error is thrown.
 Manifest extract(gcm::Image& image, const std::filesystem::path& out_dir,

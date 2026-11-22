@@ -12,6 +12,7 @@ add_library(torecomp_common STATIC
   src/sha1.cpp
   src/gcm.cpp
   src/content.cpp
+  src/hostpath.cpp
   src/dumps.cpp)
 target_include_directories(torecomp_common PUBLIC include)
 target_include_directories(torecomp_common PRIVATE third_party/tomlplusplus)
