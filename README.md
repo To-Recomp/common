@@ -47,7 +47,7 @@ torecomp-disc extract --unverified <disc.iso> <out>
 
 ## `dumps.toml`
 
-Lives in each game repository (see `symphonia-recomp/dumps.toml`). Format 1: one `[[release]]` per platform and region, with a `[[release.disc]]` for every disc, carrying `game_id`, `disc` (0-based), `size`, `sha1` (Redump) and/or `content_sha1`. Each release has a `status` of `stable`, `beta`, `alpha` or `unsupported`.
+Lives in each game repository (see `tos-recomp/dumps.toml`). Format 1: one `[[release]]` per platform and region, with a `[[release.disc]]` for every disc, carrying `game_id`, `disc` (0-based), `size`, `sha1` (Redump) and/or `content_sha1`. Each release has a `status` of `stable`, `beta`, `alpha` or `unsupported`.
 
 ## Third-party code
 
