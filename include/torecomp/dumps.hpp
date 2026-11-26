@@ -25,6 +25,7 @@ struct DiscRecord {
   std::uint64_t size = 0;
   std::string title;
   std::optional<std::int64_t> redump_id;
+  std::string serial;        // Redump serial, e.g. "DL-DOL-GQSF-0-FRA" (may be empty); shown to say which image to look for
   std::string sha1;          // whole image, as listed by Redump (may be empty)
   std::string content_sha1;  // see Manifest (may be empty until generated from a trusted dump)
 };
