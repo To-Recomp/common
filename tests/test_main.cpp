@@ -279,7 +279,7 @@ static void test_content_hash_ignores_padding(const Temp& t) {
 
 static std::string db_text(const std::string& sha1, const std::string& content) {
   return "format = 1\n[[release]]\nid = \"test\"\nplatform = \"gamecube\"\nregion = \"X\"\ntitle = \"Test Game\"\n"
-         "status = \"alpha\"\n[[release.disc]]\ngame_id = \"TEST\"\ndisc = 0\nsize = 1\ntitle = \"Disc 1\"\n"
+         "status = \"alpha\"\n[[release.disc]]\ngame_id = \"TEST\"\ndisc = 0\nsize = 1\ntitle = \"Disc 1\"\nserial = \"DL-DOL-TEST-0-XXX\"\n"
          "sha1 = \"" + sha1 + "\"\ncontent_sha1 = \"" + content + "\"\n"
          "[[release.disc]]\ngame_id = \"TEST\"\ndisc = 1\nsize = 1\ntitle = \"Disc 2\"\n"
          "content_sha1 = \"" + std::string(40, '1') + "\"\n";
@@ -295,6 +295,8 @@ static void test_identify(const Temp& t) {
   Identification a = identify(db, original);
   CHECK(a.level == Level::RedumpVerified);
   CHECK(a.disc && a.disc->disc_number == 0);
+  CHECK(a.disc->serial == "DL-DOL-TEST-0-XXX");
+  CHECK(db.releases()[0].discs[1].serial.empty());
 
   gcm::Image scrubbed(t.write("scrub.iso", build_image(tree, 0x00)));
   Identification b = identify(db, scrubbed);

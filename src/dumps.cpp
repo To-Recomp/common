@@ -104,6 +104,7 @@ Database Database::parse(std::string_view text, const std::string& source) {
       d.size = static_cast<std::uint64_t>(required<std::int64_t>(*dt, "size", where));
       d.title = required<std::string>(*dt, "title", where);
       d.redump_id = optional_value<std::int64_t>(*dt, "redump_id");
+      d.serial = optional_value<std::string>(*dt, "serial").value_or("");
       d.sha1 = optional_value<std::string>(*dt, "sha1").value_or("");
       d.content_sha1 = optional_value<std::string>(*dt, "content_sha1").value_or("");
       if (d.sha1.empty() && d.content_sha1.empty()) throw Error(where + ": a disc needs sha1 or content_sha1");
